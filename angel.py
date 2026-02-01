@@ -3,6 +3,8 @@ import os
 import re
 import requests
 from dotenv import load_dotenv
+from typing import Optional   # ← Yeh line add karo
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
