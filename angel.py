@@ -1,9 +1,11 @@
 import os
 import re
 import logging
-import requests
 import aiohttp
+import requests
 from dotenv import load_dotenv
+from typing import Optional, List
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -19,12 +21,11 @@ from telegram.ext import (
     filters,
 )
 
-# ================= CONFIG =================
-
+# ───────────────────────────
+# ENV + LOGGING
+# ───────────────────────────
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-JISSHU_API = "https://jisshuapis.vercel.app/api.php?query="
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,240 +33,238 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ================= STORAGE =================
-# user_id -> data
-USERS = {}
+# ───────────────────────────
+# CONSTANTS
+# ───────────────────────────
+JISSHU_API = "https://jisshuapis.vercel.app/api.php?query="
 
-# ================= HELPERS =================
+IMAGE_URL_RE = re.compile(
+    r"https?://.*\.(jpg|jpeg|png|webp)", re.IGNORECASE
+)
 
-def extract_title_year(text: str):
+# ───────────────────────────
+# IN-MEMORY USER STORE
+# ───────────────────────────
+users = {}
+# user_id → {
+#   mode, thumb_file_id, posters, poster_index, pending_videos
+# }
+
+# ───────────────────────────
+# HELPERS
+# ───────────────────────────
+def extract_title_year(caption: str):
     """
-    Examples:
-    Spring Fever (2025) S01E08 720p
-    Haq (2025) 720p NF WEBRip
+    Spring Fever (2025) S01E08 720p → Spring Fever, 2025
     """
-    if not text:
+    if not caption:
         return None, None
 
-    m = re.search(r"(.+?)\s*\((\d{4})\)", text)
+    caption = caption.replace(".", " ")
+    m = re.search(r"(.+?)\s*\((\d{4})\)", caption)
     if m:
         return m.group(1).strip(), int(m.group(2))
 
-    # fallback: first 5 words
-    words = re.split(r"[.\-|_ ]+", text)
-    title = " ".join(words[:5])
-    return title.strip(), None
+    words = caption.split()
+    return " ".join(words[:5]).strip(), None
 
 
-async def fetch_posters(title: str, year=None):
+async def fetch_posters(title: str, year: Optional[int]) -> List[str]:
     query = f"{title} {year}" if year else title
-    query = re.sub(r"[^\w\s]", "", query).replace(" ", "+")
+    query = query.replace(" ", "+")
+
     url = JISSHU_API + query
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=8) as r:
+            if r.status != 200:
+                return []
+            data = await r.json()
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=6) as r:
-                if r.status != 200:
-                    return []
+    posters = []
+    for k in ("jisshu-2", "jisshu-3", "jisshu-4"):
+        posters += data.get(k, [])
 
-                data = await r.json()
-
-        posters = []
-        for k in ("jisshu-2", "jisshu-3", "jisshu-4"):
-            posters.extend(data.get(k, []))
-
-        # unique + limit
-        posters = list(dict.fromkeys(posters))[:10]
-        return posters
-
-    except Exception as e:
-        logger.error(f"Poster fetch error: {e}")
-        return []
+    return list(dict.fromkeys(posters))[:10]
 
 
-# ================= COMMANDS =================
+def poster_keyboard(uid: int, idx: int, total: int):
+    btns = []
+    if idx > 0:
+        btns.append(InlineKeyboardButton("⬅ Prev", callback_data=f"prev:{uid}"))
+    btns.append(InlineKeyboardButton(f"{idx+1}/{total}", callback_data="noop"))
+    if idx < total - 1:
+        btns.append(InlineKeyboardButton("Next ➡", callback_data=f"next:{uid}"))
 
+    return InlineKeyboardMarkup([
+        btns,
+        [InlineKeyboardButton("✅ Apply to all", callback_data=f"apply:{uid}")]
+    ])
+
+# ───────────────────────────
+# COMMANDS
+# ───────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    users[uid] = {
+        "mode": None,
+        "thumb_file_id": None,
+        "posters": [],
+        "poster_index": 0,
+        "pending_videos": [],
+    }
+
     kb = ReplyKeyboardMarkup(
         [["Manual Mode", "Auto Mode"]],
         resize_keyboard=True
     )
 
-    USERS[update.effective_user.id] = {
-        "mode": None,
-        "thumb_file_id": None,
-        "videos": [],
-        "posters": [],
-        "idx": 0,
-    }
-
     await update.message.reply_text(
         "🤖 *Thumbnail Cover Bot*\n\n"
-        "Manual → Thumbnail bhejo → Video\n"
-        "Auto → Sirf video bhejo (poster auto)\n\n"
-        "Mode select karo 👇",
-        reply_markup=kb,
-        parse_mode="Markdown"
+        "Manual → thumbnail bhejo → video bhejo\n"
+        "Auto → sirf video bhejo (caption ke basis pe poster)\n",
+        parse_mode="Markdown",
+        reply_markup=kb
     )
 
 
 async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    text = update.message.text.lower()
-
-    if uid not in USERS:
+    if uid not in users:
         return
 
+    text = update.message.text.lower()
     if "manual" in text:
-        USERS[uid]["mode"] = "manual"
-        await update.message.reply_text("✅ Manual mode ON\nThumbnail bhejo")
-
+        users[uid]["mode"] = "manual"
+        await update.message.reply_text("✅ Manual mode ON\nThumbnail bhejo.")
     elif "auto" in text:
-        USERS[uid]["mode"] = "auto"
-        await update.message.reply_text("✅ Auto mode ON\nAb video bhejo")
+        users[uid]["mode"] = "auto"
+        await update.message.reply_text("✅ Auto mode ON\nVideo bhejo.")
 
-
-# ================= MANUAL MODE =================
-
+# ───────────────────────────
+# MANUAL MODE
+# ───────────────────────────
 async def save_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if USERS.get(uid, {}).get("mode") != "manual":
+    if users.get(uid, {}).get("mode") != "manual":
         return
 
-    if update.message.photo:
-        USERS[uid]["thumb_file_id"] = update.message.photo[-1].file_id
-        await update.message.reply_text("✅ Thumbnail saved. Ab video bhejo")
+    users[uid]["thumb_file_id"] = update.message.photo[-1].file_id
+    await update.message.reply_text("🖼 Thumbnail saved. Ab video bhejo.")
 
 
-async def handle_manual_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def manual_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = USERS.get(uid)
+    data = users.get(uid)
 
-    if not user or user["mode"] != "manual":
+    if not data or data["mode"] != "manual":
         return
 
-    if not user["thumb_file_id"]:
-        await update.message.reply_text("⚠️ Pehle thumbnail bhejo")
+    thumb = data.get("thumb_file_id")
+    if not thumb:
+        await update.message.reply_text("⚠ Pehle thumbnail bhejo.")
         return
 
     await context.bot.send_video(
         chat_id=update.effective_chat.id,
         video=update.message.video.file_id,
-        cover=user["thumb_file_id"],
-        caption=update.message.caption or ""
+        cover=thumb,
+        caption=update.message.caption or "",
+        supports_streaming=True
     )
+
     await update.message.delete()
 
-
-# ================= AUTO MODE =================
-
-async def handle_auto_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ───────────────────────────
+# AUTO MODE
+# ───────────────────────────
+async def auto_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = USERS.get(uid)
+    data = users.get(uid)
 
-    if not user or user["mode"] != "auto":
+    if not data or data["mode"] != "auto":
         return
 
-    caption = update.message.caption or ""
-    title, year = extract_title_year(caption)
-
+    title, year = extract_title_year(update.message.caption or "")
     if not title:
-        await update.message.reply_text("❌ Caption se title nahi mila")
+        await update.message.reply_text("❌ Caption me title nahi mila.")
         return
 
     posters = await fetch_posters(title, year)
     if not posters:
-        await update.message.reply_text("❌ Poster nahi mila")
+        await update.message.reply_text("❌ Poster nahi mila.")
         return
 
-    user["posters"] = posters
-    user["idx"] = 0
-    user["videos"].append(update.message.video.file_id)
-
-    await show_poster(update, context)
-
-
-async def show_poster(update_or_query, context):
-    if isinstance(update_or_query, Update):
-        chat_id = update_or_query.effective_chat.id
-        uid = update_or_query.effective_user.id
-    else:
-        chat_id = update_or_query.message.chat.id
-        uid = update_or_query.from_user.id
-
-    user = USERS[uid]
-    idx = user["idx"]
-    total = len(user["posters"])
-
-    buttons = []
-    if idx > 0:
-        buttons.append(InlineKeyboardButton("⬅ Prev", callback_data="prev"))
-    if idx < total - 1:
-        buttons.append(InlineKeyboardButton("Next ➡", callback_data="next"))
-
-    buttons2 = [
-        InlineKeyboardButton("✅ Apply", callback_data="apply")
-    ]
-
-    kb = InlineKeyboardMarkup([buttons, buttons2])
+    data["posters"] = posters
+    data["poster_index"] = 0
+    data["pending_videos"].append(update.message.video.file_id)
 
     await context.bot.send_photo(
-        chat_id=chat_id,
-        photo=user["posters"][idx],
-        caption=f"Poster {idx+1}/{total}",
-        reply_markup=kb
+        chat_id=update.effective_chat.id,
+        photo=posters[0],
+        caption=f"Poster for *{title}*",
+        parse_mode="Markdown",
+        reply_markup=poster_keyboard(uid, 0, len(posters))
     )
 
-
-async def poster_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ───────────────────────────
+# CALLBACKS
+# ───────────────────────────
+async def poster_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    uid = q.from_user.id
-    user = USERS.get(uid)
+    action, uid = q.data.split(":")
+    uid = int(uid)
+    data = users.get(uid)
 
-    if not user:
+    if not data:
         return
 
-    if q.data == "prev":
-        user["idx"] -= 1
-    elif q.data == "next":
-        user["idx"] += 1
-    elif q.data == "apply":
-        url = user["posters"][user["idx"]]
-        img = requests.get(url).content
+    if action == "prev":
+        data["poster_index"] -= 1
+    elif action == "next":
+        data["poster_index"] += 1
+    elif action == "apply":
+        poster_url = data["posters"][data["poster_index"]]
+        img = requests.get(poster_url).content
 
-        for vid in user["videos"]:
+        for vid in data["pending_videos"]:
             await context.bot.send_video(
                 chat_id=q.message.chat.id,
                 video=vid,
                 cover=img,
-                caption="✅ Auto poster applied"
+                supports_streaming=True
             )
 
-        user["videos"].clear()
+        data["pending_videos"].clear()
         await q.message.delete()
         return
 
-    await q.message.delete()
-    await show_poster(q, context)
+    idx = data["poster_index"]
+    await q.message.edit_media(
+        media=q.message.photo[-1].copy(photo=data["posters"][idx]),
+        reply_markup=poster_keyboard(uid, idx, len(data["posters"]))
+    )
 
-
-# ================= MAIN =================
-
+# ───────────────────────────
+# MAIN
+# ───────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^(Manual Mode|Auto Mode)$"), set_mode))
 
+    # MANUAL
     app.add_handler(MessageHandler(filters.PHOTO, save_thumbnail))
-    app.add_handler(MessageHandler(filters.VIDEO & filters.Caption(True), handle_auto_video))
-    app.add_handler(MessageHandler(filters.VIDEO, handle_manual_video))
+    app.add_handler(MessageHandler(filters.VIDEO & ~filters.CAPTION, manual_video))
 
-    app.add_handler(CallbackQueryHandler(poster_buttons))
+    # AUTO (IMPORTANT FIX)
+    app.add_handler(MessageHandler(filters.VIDEO & filters.CAPTION, auto_video))
 
-    logger.info("Bot started")
+    app.add_handler(CallbackQueryHandler(poster_callback))
+
+    logger.info("Bot started ✅")
     app.run_polling(drop_pending_updates=True)
 
 
