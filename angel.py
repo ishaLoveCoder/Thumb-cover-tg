@@ -2,6 +2,8 @@ import logging
 import os
 import re
 import requests
+import asyncio
+import aiohttp
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -14,10 +16,10 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
-# Setup logging
+# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s - %(message)s',
@@ -28,8 +30,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot Configuration
+# Bot Token
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# Jisshu API
+JISSHU_API = "https://jisshuapis.vercel.app/api.php?query="
 
 # Conversation states
 SETTINGS_MENU = range(1)
@@ -40,273 +45,264 @@ URL_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# User data store (global dict – production mein database use karna)
+user_data = {}  # user_id → {'mode': 'manual'/'auto', 'thumb_file_id': str, 'posters': list, 'current_idx': 0, 'videos': list}
+
+# --- Helper Functions ---
+
+def extract_title_year(caption: str):
+    """Caption se title aur year nikaalo"""
+    match = re.search(r'(.+?)\s*\((\d{4})\)', caption, re.IGNORECASE)
+    if match:
+        return match.group(1).strip(), int(match.group(2))
+    # Agar year nahi mila to pehle 5-6 words title samajh lo
+    words = caption.split()
+    title = " ".join(words[:6]).strip()
+    return title, None
+
+async def fetch_posters(title: str, year: int = None) -> list:
+    """Jisshu API se posters dhundho"""
+    query = f"{title}+{year}" if year else title
+    query = query.replace(" ", "+").replace(":", "").replace("(", "").replace(")", "")
+    url = f"{JISSHU_API}{query}"
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, timeout=5) as res:
+                if res.status != 200:
+                    logger.error(f"API Error: HTTP {res.status}")
+                    return []
+                data = await res.json()
+                
+                posters = []
+                for key in ["jisshu-2", "jisshu-3", "jisshu-4"]:
+                    if key in data and isinstance(data[key], list):
+                        posters.extend(data[key])
+                
+                # Unique kar do aur first 10 le lo
+                posters = list(dict.fromkeys(posters))[:10]
+                return posters
+        except Exception as e:
+            logger.error(f"Poster fetch error: {e}")
+            return []
+
+async def apply_cover_and_send(chat_id: int, video_file_id: str, thumb_bytes: bytes, caption: str = ""):
+    """Video pe cover apply kar ke bhejo"""
+    try:
+        await bot.send_video(
+            chat_id=chat_id,
+            video=video_file_id,
+            cover=thumb_bytes,
+            caption=caption,
+            supports_streaming=True
+        )
+        logger.info(f"Video with cover sent to {chat_id}")
+    except Exception as e:
+        logger.error(f"Error sending video with cover: {e}")
+        await bot.send_message(chat_id, f"Cover apply nahi ho paya: {str(e)}")
+
 # --- Command Handlers ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command"""
-    user_id = update.message.from_user.id
-    logger.info(f"Start command received from user {user_id}")
+    user_id = update.effective_user.id
     welcome_text = """
 🤖 <b>Thumbnail Cover Changer Bot</b>
 
-I can change video thumbnails/covers! Here's how to use me:
-
-<b>Step 1: Send me a thumbnail image (as photo or URL)</b>
-<b>Step 2: Send me a video file</b>
-<b>Step 3: I'll apply your thumbnail and send back the video</b>
+Modes:
+• <b>Manual</b>: Thumbnail bhejo → Video bhejo
+• <b>Auto</b>: Sirf video bhejo → Main poster dhund ke laga dunga (TMDB/Jisshu API se)
 
 <b>Commands:</b>
-<b>/start - Show this help message</b>
-<b>/thumb - View your current saved thumbnail</b>
-<b>/clear - Clear your saved thumbnail</b>
-<b>/settings - Configure caption styles</b>
+/start - Yeh message
+/thumb - Current thumbnail dekho
+/clear - Thumbnail hatao
+/settings - Caption style change karo
     """
-    await update.message.reply_text(welcome_text, parse_mode='HTML')
-    logger.info(f"Start message sent to user {user_id}")
-
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle /settings command"""
-    user_id = update.message.from_user.id
-    logger.info(f"Settings command received from user {user_id}")
-    
-    # Set default caption style to bold if not set
-    if 'caption_style' not in context.user_data:
-        context.user_data['caption_style'] = 'bold'
-    
-    # Check thumbnail status
-    thumb_status = "✅ Saved" if context.user_data.get("thumb_file_id") else "❌ Not Saved"
-    current_style = context.user_data.get('caption_style', 'bold')
-    
-    settings_text = f"""
-⚙️ <b>Settings Menu</b>
-
-👤 <b>User ID:</b> <code>{user_id}</code>
-🖼️ <b>Thumbnail Status:</b> {thumb_status}
-📝 <b>Current Caption Style:</b> {current_style.title()}
-
-<b>Choose your preferred caption style:</b>
-    """
-    
     keyboard = [
-        [InlineKeyboardButton("𝐁𝐨𝐥𝐝", callback_data="style_bold")],
-        [InlineKeyboardButton("𝘐𝘵𝘢𝘭𝘪𝘤", callback_data="style_italic")],
-        [InlineKeyboardButton("𝙼𝚘𝚗𝚘𝚜𝚙𝚊𝚌𝚎", callback_data="style_monospace")],
-        [InlineKeyboardButton("🗑️ Clear Style", callback_data="style_clear")],
-        [InlineKeyboardButton("✅ Done", callback_data="style_done")]
+        ["Manual Mode", "Auto Mode"]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(settings_text, reply_markup=reply_markup, parse_mode='HTML')
-    return SETTINGS_MENU
+    reply_markup = types.ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text(welcome_text, parse_mode='HTML', reply_markup=reply_markup)
 
-async def settings_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle button presses in settings menu"""
-    query = update.callback_query
-    await query.answer()
+async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    text = update.message.text.lower()
     
-    user_data = context.user_data
-    user_id = query.from_user.id
-    
-    if query.data == "style_bold":
-        user_data['caption_style'] = 'bold'
-        style_text = "𝐁𝐨𝐥𝐝"
-    elif query.data == "style_italic":
-        user_data['caption_style'] = 'italic'
-        style_text = "𝘐𝘵𝘢𝘭𝘪𝘤"
-    elif query.data == "style_monospace":
-        user_data['caption_style'] = 'monospace'
-        style_text = "𝙼𝚘𝚗𝚘𝚜𝚙𝚊𝚌𝚎"
-    elif query.data == "style_clear":
-        user_data['caption_style'] = 'none'
-        style_text = "Normal"
-    elif query.data == "style_done":
-        await query.edit_message_text("✅ <b>Settings saved successfully!</b>", parse_mode='HTML')
-        logger.info(f"Settings saved for user {user_id}")
-        return ConversationHandler.END
-    
-    # Update the settings menu with new style
-    thumb_status = "✅ Saved" if user_data.get("thumb_file_id") else "❌ Not Saved"
-    current_style = user_data.get('caption_style', 'bold')
-    
-    settings_text = f"""
-⚙️ <b>Settings Menu</b>
-
-👤 <b>User ID:</b> <code>{user_id}</code>
-🖼️ <b>Thumbnail Status:</b> {thumb_status}
-📝 <b>Current Caption Style:</b> {current_style.title()}
-
-✅ <b>Caption style set to: {style_text}</b>
-
-<b>Choose your preferred caption style:</b>
-    """
-    
-    keyboard = [
-        [InlineKeyboardButton("𝐁𝐨𝐥𝐝", callback_data="style_bold")],
-        [InlineKeyboardButton("𝘐𝘵𝘢𝘭𝘪𝘤", callback_data="style_italic")],
-        [InlineKeyboardButton("𝙼𝚘𝚗𝚘𝚜𝚙𝚊𝚌𝚎", callback_data="style_monospace")],
-        [InlineKeyboardButton("🗑️ Clear Style", callback_data="style_clear")],
-        [InlineKeyboardButton("✅ Done", callback_data="style_done")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(settings_text, reply_markup=reply_markup, parse_mode='HTML')
-    logger.info(f"Caption style changed to {current_style} for user {user_id}")
-    return SETTINGS_MENU
-
-async def view_thumb_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /thumb command to view current thumbnail"""
-    thumb_file_id = context.user_data.get("thumb_file_id")
-    if thumb_file_id:
-        try:
-            await update.message.reply_photo(
-                thumb_file_id,
-                caption="📷 <b>Your Current Thumbnail</b>\n\nSend a video to apply this thumbnail!",
-                parse_mode='HTML'
-            )
-            logger.info("Thumbnail sent to user")
-        except Exception as e:
-            logger.error(f"Error sending thumbnail: {e}")
-            await update.message.reply_text("❌ Error displaying thumbnail. Please set a new one.")
+    if "manual" in text:
+        mode = "manual"
+        msg = "Manual mode ON! Thumbnail bhejo (photo/URL), fir video bhejo."
+    elif "auto" in text:
+        mode = "auto"
+        msg = "Auto mode ON! Bas video bhejo – main poster dhund ke laga dunga."
     else:
-        await update.message.reply_text("📷 <b>No Thumbnail Saved</b>\n\nPlease send me a photo first!", parse_mode='HTML')
+        return
+    
+    user_data[user_id] = {
+        'mode': mode,
+        'thumb_file_id': None,
+        'thumb_bytes': None,
+        'posters': [],
+        'current_idx': 0,
+        'videos': []
+    }
+    await update.message.reply_text(msg)
 
-async def clear_thumb_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /clear command to remove saved thumbnail"""
-    context.user_data.pop("thumb_file_id", None)
-    await update.message.reply_text("✅ Thumbnail cleared successfully!")
-    logger.info("Thumbnail cleared")
-
-# Save photo as thumbnail
-async def save_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["thumb_file_id"] = update.message.photo[-1].file_id
-    await update.message.reply_text("✅ Thumbnail saved! Now send a video to apply it.")
-
-# Handle URL thumbnails
-async def handle_url_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle image URLs for thumbnails"""
+async def save_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in user_data or user_data[user_id]['mode'] != "manual":
+        return
+    
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        user_data[user_id]['thumb_file_id'] = file_id
+        await update.message.reply_text("✅ Thumbnail saved! Ab video bhejo.")
+        return
+    
+    # URL thumbnail
     url = update.message.text
-    user_id = update.message.from_user.id
+    if not URL_PATTERN.match(url):
+        return
     
     try:
-        # Validate URL pattern
-        if not URL_PATTERN.match(url):
-            await update.message.reply_text("❌ Please send a valid image URL (jpg, jpeg, png, webp, bmp)")
-            return
-        
-        # Download image
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        
-        # Check content type
-        content_type = response.headers.get('content-type', '')
-        if not content_type.startswith('image/'):
-            await update.message.reply_text("❌ URL does not point to a valid image")
-            return
-        
-        # Send image to Telegram to get file_id
-        message = await update.message.reply_photo(
-            photo=response.content,
-            caption="🖼️ Downloaded image from URL..."
-        )
-        
-        # Get the file_id from the sent photo
-        thumb_file_id = message.photo[-1].file_id
-        context.user_data["thumb_file_id"] = thumb_file_id
-        
-        await update.message.reply_text("✅ Thumbnail saved from URL! Now send a video to apply it.")
-        logger.info(f"Thumbnail saved from URL for user {user_id}")
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"URL download error for user {user_id}: {e}")
-        await update.message.reply_text("❌ Failed to download image from URL. Please check the link and try again.")
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        user_data[user_id]['thumb_bytes'] = r.content
+        await update.message.reply_text("✅ Thumbnail from URL saved! Ab video bhejo.")
     except Exception as e:
-        logger.error(f"URL thumbnail error for user {user_id}: {e}")
-        await update.message.reply_text("❌ Error processing URL. Please try a different image URL.")
+        await update.message.reply_text(f"URL se thumbnail nahi laga paya: {str(e)}")
 
-# Send video with saved cover and styled caption
-async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    thumb_file_id = context.user_data.get("thumb_file_id")
-    if not thumb_file_id:
-        await update.message.reply_text("⚠️ Please send a thumbnail first.")
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in user_data:
+        await update.message.reply_text("Pehle /start karo aur mode select karo!")
         return
 
-    video_file_id = update.message.video.file_id
-    original_caption = update.message.caption or ""
+    video = update.message.video
+    caption = update.message.caption or ""
     
-    # Apply caption style
-    caption_style = context.user_data.get('caption_style', 'bold')
-    if caption_style == 'bold' and original_caption:
-        styled_caption = f"<b>{original_caption}</b>"
-    elif caption_style == 'italic' and original_caption:
-        styled_caption = f"<i>{original_caption}</i>"
-    elif caption_style == 'monospace' and original_caption:
-        styled_caption = f"<code>{original_caption}</code>"
-    else:
-        styled_caption = original_caption
-
-    await context.bot.send_video(
-        chat_id=update.message.chat_id,
-        video=video_file_id,
-        caption=styled_caption,
-        cover=thumb_file_id,  # ✅ Apply custom cover
-        parse_mode='HTML'
-    )
+    mode = user_data[user_id]['mode']
     
-    # Delete the original video message
-    try:
-        await update.message.delete()
-        logger.info(f"Original video message deleted for user {update.message.from_user.id}")
-    except Exception as e:
-        logger.error(f"Failed to delete original video message for user {update.message.from_user.id}: {e}")
-
-async def cancel_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel the settings conversation"""
-    await update.message.reply_text("❌ Settings menu closed.")
-    return ConversationHandler.END
-
-def main() -> None:
-    """Start the bot."""
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not found in environment variables. Exiting.")
+    if mode == "manual":
+        thumb_file_id = user_data[user_id].get('thumb_file_id')
+        thumb_bytes = user_data[user_id].get('thumb_bytes')
+        
+        if not thumb_file_id and not thumb_bytes:
+            await update.message.reply_text("Pehle thumbnail bhejo!")
+            return
+        
+        # Apply cover
+        if thumb_file_id:
+            await context.bot.send_video(
+                chat_id=update.message.chat_id,
+                video=video.file_id,
+                cover=thumb_file_id,
+                caption=caption
+            )
+        elif thumb_bytes:
+            await context.bot.send_video(
+                chat_id=update.message.chat_id,
+                video=video.file_id,
+                cover=thumb_bytes,
+                caption=caption
+            )
+        await update.message.delete()  # original delete
         return
 
-    # Create the Application and pass it your bot's token.
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Auto mode
+    title, year = extract_title_year(caption)
+    if not title:
+        await update.message.reply_text("Caption se title nahi mila. Manual mode use karo ya caption daalo.")
+        return
 
-    # --- Register Handlers ---
+    posters = await fetch_posters(title, year)
+    if not posters:
+        await update.message.reply_text(f"'{title}' ke liye poster nahi mila")
+        return
+
+    # Store posters and video
+    user_data[user_id]['posters'] = posters
+    user_data[user_id]['current_idx'] = 0
+    user_data[user_id]['videos'] = user_data[user_id].get('videos', []) + [video.file_id]
+
+    # Show first poster with buttons
+    await show_poster_selection(update.effective_chat.id, user_id)
+
+# Poster selection with buttons
+async def show_poster_selection(chat_id: int, user_id: int):
+    data = user_data.get(user_id)
+    if not data or not data.get('posters'):
+        return
     
-    # Command Handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("thumb", view_thumb_command))
-    application.add_handler(CommandHandler("clear", clear_thumb_command))
+    idx = data['current_idx']
+    url = data['posters'][idx]
     
-    # Settings Conversation Handler
-    settings_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("settings", settings_command)],
-        states={
-            SETTINGS_MENU: [
-                CommandHandler("settings", settings_command),
-                CallbackQueryHandler(settings_button_handler)
-            ]
-        },
-        fallbacks=[CommandHandler("cancel", cancel_settings)]
+    markup = InlineKeyboardMarkup(row_width=3)
+    if idx > 0:
+        markup.add(InlineKeyboardButton("<< Prev", callback_data=f"prev_{user_id}"))
+    markup.add(InlineKeyboardButton(f"{idx+1}/{len(data['posters'])}", callback_data="dummy"))
+    if idx < len(data['posters'])-1:
+        markup.add(InlineKeyboardButton("Next >>", callback_data=f"next_{user_id}"))
+    
+    markup.add(InlineKeyboardButton("✅ Choose & Apply to All", callback_data=f"apply_{user_id}_{idx}"))
+    
+    await bot.send_photo(
+        chat_id=chat_id,
+        photo=url,
+        caption=f"Poster {idx+1}/{len(data['posters'])}\n\nChoose karo ya next/prev karo",
+        reply_markup=markup
     )
-    application.add_handler(settings_conv_handler)
 
-    # Message Handlers
-    application.add_handler(MessageHandler(filters.PHOTO, save_thumb))
-    application.add_handler(MessageHandler(filters.VIDEO, send_video))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url_thumb))
+# Callback for buttons
+@bot.callback_query_handler(func=lambda call: True)
+def callback_query(call):
+    data = call.data
+    if not data.startswith(('prev_', 'next_', 'apply_')):
+        return
+    
+    parts = data.split('_')
+    action = parts[0]
+    user_id = int(parts[1])
+    
+    if call.from_user.id != user_id:
+        bot.answer_callback_query(call.id, "Yeh button aapka nahi hai!")
+        return
+    
+    if action == "prev":
+        user_data[user_id]['current_idx'] = max(0, user_data[user_id]['current_idx'] - 1)
+    elif action == "next":
+        user_data[user_id]['current_idx'] = min(len(user_data[user_id]['posters']) - 1, user_data[user_id]['current_idx'] + 1)
+    
+    elif action == "apply":
+        idx = int(parts[2])
+        poster_url = user_data[user_id]['posters'][idx]
+        
+        # Download poster
+        try:
+            r = requests.get(poster_url, timeout=10)
+            r.raise_for_status()
+            poster_bytes = r.content
+        except:
+            bot.answer_callback_query(call.id, "Poster download fail hua")
+            return
+        
+        # Apply to all queued videos
+        for video_file_id in user_data[user_id].get('videos', []):
+            bot.send_video(
+                call.message.chat.id,
+                video=video_file_id,
+                cover=poster_bytes,
+                caption="Auto Poster Applied!"
+            )
+        
+        bot.answer_callback_query(call.id, "Applied to all videos!")
+        user_data[user_id]['videos'] = []  # clear
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+        return
+    
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    asyncio.run_coroutine_threadsafe(show_poster_selection(call.message.chat.id, user_id), asyncio.get_event_loop())
+    bot.answer_callback_query(call.id)
 
-    # Start the Bot
-    logger.info("Starting Thumbnail Cover Changer Bot...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
-
+# Cell 14: Start polling (last cell)
+print("Bot starting...")
+bot.infinity_polling(timeout=10, long_polling_timeout=5)
